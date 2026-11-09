@@ -23,9 +23,12 @@ from pyproj import CRS, Geod, Transformer
 from pyproj.aoi import AreaOfInterest
 from pyproj.transformer import TransformerGroup
 from shapely import make_valid
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, mapping
 from shapely.ops import nearest_points, polygonize, substring, transform, unary_union
 from streamlit_folium import st_folium
+from folium.plugins import Fullscreen, LocateControl
+from branca.element import MacroElement
+from jinja2 import Template
 
 APP = "Tactical Pathfinder SSS+++"
 GEOD = Geod(ellps="WGS84")
@@ -209,9 +212,8 @@ assign uphillcutoff = 1.5
 assign downhillcost = 30
 assign downhillcutoff = 1.5
 ---context:way
-assign footaccess = if foot=no|private then false
- else if foot=yes|designated|permissive then true
- else if access=no|private|military|permit then false else true
+assign defaultaccess = if access= then true else access=yes|permissive|designated
+assign footaccess = if foot= then defaultaccess else foot=yes|designated|permissive
 assign nodeaccessgranted = foot=yes|designated|permissive
 assign turncost = 0
 assign initialcost = 0
@@ -240,12 +242,11 @@ assign costfactor =
  else if highway=steps then 4.0
  else 2.0
 ---context:node
+assign defaultaccess = if access= then true else access=yes|permissive|designated
+assign footaccess = if foot= then defaultaccess else foot=yes|designated|permissive
 assign initialcost =
 {NODE_EXTRA}
- if foot=no|private then 1000000
- else if foot=yes|designated|permissive then 0
- else if access=no|private|military|permit then 1000000
- else 0
+ if footaccess then 0 else 1000000
 """
     return script.replace("{EXTRA}", "\n".join(way_extra)).replace("{NODE_EXTRA}", "\n".join(node_extra) + "\n else" if node_extra else ""), notes
 
@@ -480,7 +481,7 @@ def audit_route(route, primary, progress=None):
     warnings, geometry_errors = analyse_osm(route["coords"], elements)
     errors += geometry_errors
     return {"warnings": warnings, "errors": errors, "complete": not errors,
-            "sources": sources, "count": len(elements),
+            "sources": sources, "count": len(elements), "features": osm_features(elements),
             "at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -680,47 +681,211 @@ def export_gpx(route, points, audit, heat=None):
     return gpx.to_xml(version="1.1").encode("utf-8")
 
 
-def make_map(points, routes, selected, audit, nogos, topo, heat):
-    center = [55.19, 30.20] if not points else points[0]
-    m = folium.Map(location=center, zoom_start=10, tiles=None, control_scale=True,
-                   prefer_canvas=True)
-    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                     attr="Esri, Maxar, Earthstar Geographics and imagery contributors",
-                     name="Спутник · Esri", max_zoom=19).add_to(m)
-    folium.TileLayer("https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
-                     attr="© OpenStreetMap contributors · CyclOSM", name="CyclOSM", max_zoom=20).add_to(m)
-    folium.TileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                     attr="© OpenStreetMap contributors", name="OpenStreetMap", max_zoom=19).add_to(m)
-    for template, label, attr in ((topo, "Генштаб / ГГЦ · источник пользователя", "Источник топокарты пользователя"),
-                                   (heat, "Strava · источник пользователя", "© Strava · authorised source")):
-        if template.strip():
-            folium.TileLayer(check_template(template), attr=attr, name=label, overlay=True,
-                             opacity=.55, show=False, max_native_zoom=14 if template == heat else 16,
-                             max_zoom=20).add_to(m)
-    if len(points) >= 2:
-        az, _, d = GEOD.inv(points[0][1], points[0][0], points[-1][1], points[-1][0])
-        folium.PolyLine([points[0], points[-1]], color="#ef4444", dash_array="9 7", weight=3,
-                        tooltip=f"Птичка: {d/1000:.2f} км · истинный азимут {az%360:.1f}°").add_to(m)
-    for i, p in enumerate(points):
-        label = "А · Старт" if i == 0 else "Б · Финиш" if i == len(points)-1 else f"Промежуточная {i}"
-        folium.Marker(p, tooltip=label, icon=folium.Icon(color="red" if i == len(points)-1 else "blue", icon="flag")).add_to(m)
-    for i, r in enumerate(routes):
+
+# ----- v2: map-first interface and visible environmental overlays -----
+TOPO_XYZ = "https://tiles.nakarte.me/topomapper/{z}/{x}/{y}"
+GGC_TMS = "https://a.tiles.nakarte.me/ggc1000/{z}/{x}/{y}"
+STRAVA_XYZ = "https://content-a.strava.com/identified/globalheat/run/hot/{z}/{x}/{y}.png?px=256"
+OSM_TRACES = "https://a.gps-tile.openstreetmap.org/lines/{z}/{x}/{y}.png"
+EMPTY_FEATURES = {"type": "FeatureCollection", "features": []}
+
+
+def osm_features(elements):
+    features, seen = [], set()
+    for e in elements:
+        tags = e.get("tags", {})
+        kind = ("wetland" if tags.get("natural") == "wetland" else
+                "water" if tags.get("waterway") in ("river", "stream", "canal", "drain", "ditch") else
+                "bad_ground" if tags.get("surface") in ("mud", "peat") or tags.get("tracktype") in ("grade4", "grade5") else
+                "restricted" if tags.get("foot") in ("no", "private", "permit") or
+                    tags.get("access") in ("private", "no", "military", "permit") else None)
+        if not kind:
+            continue
+        uid = f"{e['type']}/{e['id']}"
+        if uid in seen:
+            continue
+        try:
+            g = element_geometry(e)
+            if g is None or g.is_empty:
+                continue
+            props = {"kind": kind, "osm": uid,
+                     "description": html.escape(" · ".join(f"{k}={tags[k]}" for k in
+                        ("natural", "wetland", "waterway", "tracktype", "surface", "access", "foot") if k in tags))}
+            features.append({"type": "Feature", "geometry": mapping(g), "properties": props})
+            seen.add(uid)
+        except (ValueError, TypeError, KeyError):
+            continue
+    return {"type": "FeatureCollection", "features": features}
+
+
+def merge_features(*collections):
+    result = {}
+    for coll in collections:
+        for f in (coll or EMPTY_FEATURES).get("features", []):
+            result[f["properties"]["osm"]] = f
+    return {"type": "FeatureCollection", "features": list(result.values())}
+
+
+def viewport_query(bounds):
+    sw, ne = bounds["_southWest"], bounds["_northEast"]
+    south, west, north, east = float(sw["lat"]), float(sw["lng"]), float(ne["lat"]), float(ne["lng"])
+    validate_point(south, west)
+    validate_point(north, east)
+    width = GEOD.inv(west, south, east, south)[2]
+    height = GEOD.inv(west, south, west, north)[2]
+    if not (0 < width < 22000 and 0 < height < 22000 and width*height <= 180_000_000):
+        raise ValueError("Приблизьте карту: область загрузки должна быть меньше 180 км² и 22 км по стороне.")
+    box = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
+    # is_in at viewport centre also retrieves large wetlands surrounding the viewport.
+    lat, lon = (south+north)/2, (west+east)/2
+    return (f'[out:json][timeout:40][maxsize:67108864];is_in({lat:.6f},{lon:.6f})->.a;'
+            f'area.a["natural"="wetland"]->.wetareas;('
+            f'nwr["natural"="wetland"]{box};'
+            f'way["waterway"~"^(river|stream|canal|drain|ditch)$"]{box};'
+            f'way["highway"]["tracktype"~"^grade[45]$"]{box};'
+            f'way["highway"]["surface"~"^(mud|peat)$"]{box};'
+            f'way["highway"]["access"~"^(no|private|military|permit)$"]{box};'
+            'way(pivot.wetareas);rel(pivot.wetareas););out body geom;')
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def probe_tile(template, lat, lon, zoom, tms=False):
+    x, y, _, _ = tile_position(lon, lat, zoom)
+    if tms:
+        y = 2**zoom - 1 - y
+    url = check_template(template).replace("{z}", str(zoom)).replace("{x}", str(x)).replace("{y}", str(y))
+    try:
+        r = requests.get(url, timeout=(5, 12), headers=HEADERS, allow_redirects=False)
+        if r.status_code in (401, 403):
+            return False, f"HTTP {r.status_code}: требуется разрешение/авторизация."
+        if not r.ok:
+            return False, f"HTTP {r.status_code}: для выбранной точки тайл недоступен."
+        if not r.headers.get("Content-Type", "").lower().startswith("image/"):
+            return False, "Сервис вернул не изображение (возможна страница входа)."
+        with Image.open(io.BytesIO(r.content)) as im:
+            im.verify()
+        return True, "Сервер вернул изображение для выбранной точки; отображение в браузере зависит от провайдера."
+    except (requests.RequestException, ValueError, OSError) as exc:
+        return False, str(exc)[:220]
+
+
+class TileStatusControl(MacroElement):
+    """Browser-side tile errors: do not leave a failed layer silently invisible."""
+    def __init__(self):
+        super().__init__()
+        self._name = "TileStatusControl"
+        self._template = Template(r"""{% macro script(this, kwargs) %}
+        (function(){
+          const map = {{this._parent.get_name()}};
+          const status = L.control({position:'bottomleft'});
+          status.onAdd = function(){
+            const box = L.DomUtil.create('div');
+            box.style.cssText='display:none;max-width:240px;background:#fff;color:#9f1239;padding:8px 10px;border:1px solid #fda4af;border-radius:8px;font:14px/1.4 system-ui;box-shadow:0 1px 5px #0003';
+            this.box=box; L.DomEvent.disableClickPropagation(box);return box;
+          };status.addTo(map);
+          function bind(layer){
+            if(!layer.on || !layer._url || layer.__tfBound)return;
+            layer.__tfBound=true;
+            layer.on('tileerror',function(){
+              if(map.hasLayer(layer)){
+                status.box.textContent='Слой не загрузился: '+(layer.options.tfLabel||'карта')+'. Откройте «Слои» и проверьте источник.';
+                status.box.style.display='block';
+              }
+            });
+          }
+          map.eachLayer(bind);
+          map.on('layeradd',function(e){bind(e.layer);});
+          map.on('baselayerchange overlayremove',function(){status.box.style.display='none';});
+        })();
+        {% endmacro %}""")
+
+
+def map_v2(points, routes, selected, audit, features, nogos, config, center, zoom, fit=False):
+    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True,
+                   prefer_canvas=True, zoom_control=True, max_zoom=20)
+    folium.map.CustomPane("paper", z_index=240).add_to(m)
+    folium.map.CustomPane("heat", z_index=360).add_to(m)
+    folium.map.CustomPane("terrain", z_index=430).add_to(m)
+    folium.map.CustomPane("route", z_index=610).add_to(m)
+    bases = {
+        "OSM": ("https://tile.openstreetmap.org/{z}/{x}/{y}.png", "© OpenStreetMap contributors", 19),
+        "Спутник": ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", "Esri · Maxar · Earthstar Geographics", 19),
+        "CyclOSM": ("https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png", "© OSM contributors · CyclOSM", 20),
+        "Генштаб": (TOPO_XYZ, "Soviet topo maps · AtloMaps / Nakarte", 13),
+    }
+    name = config["base"]
+    url, attr, native = bases[name]
+    if name == "Генштаб" and config["custom_topo"]:
+        url = config["custom_topo"]
+    folium.TileLayer(url, attr=attr, name=name, max_native_zoom=native, max_zoom=20,
+                     tf_label=name).add_to(m)
+    if config["ggc"]:
+        folium.TileLayer(GGC_TMS, attr="ГГЦ · Nakarte", name="ГГЦ 1 км", tms=True,
+                         overlay=True, pane="paper", max_native_zoom=13, max_zoom=20,
+                         opacity=config["paper_opacity"], tf_label="ГГЦ 1 км").add_to(m)
+    if config["heat"]:
+        folium.TileLayer(config["heat_url"], attr="© Strava Global Heatmap" if config["heat_type"] == "Strava" else "© OpenStreetMap public GPS traces (не Strava)",
+                         name=config["heat_type"], overlay=True, pane="heat", opacity=config["heat_opacity"],
+                         max_native_zoom=14, max_zoom=20, tf_label=config["heat_type"]).add_to(m)
+    styles = {
+        "wetland": {"color": "#075985", "fillColor": "#06b6d4", "fillOpacity": .30, "weight": 2.5, "dashArray": "5 4"},
+        "water": {"color": "#0067da", "weight": 3.5, "opacity": .95},
+        "bad_ground": {"color": "#9a3412", "weight": 5, "dashArray": "6 5"},
+        "restricted": {"color": "#be123c", "weight": 4, "dashArray": "2 6"},
+    }
+    allowed = {k for k in styles if config[k]}
+    visible = {"type": "FeatureCollection", "features": [f for f in features.get("features", []) if f["properties"]["kind"] in allowed]}
+    if visible["features"]:
+        folium.GeoJson(visible, name="Болота / вода / грунт", pane="terrain",
+                       style_function=lambda f: styles[f["properties"]["kind"]],
+                       tooltip=folium.GeoJsonTooltip(fields=["description"], labels=False, sticky=False)).add_to(m)
+    if len(points) >= 2 and config["beeline"]:
+        for color, weight in (("#fff", 5), ("#dc2626", 3)):
+            folium.PolyLine([points[0], points[-1]], color=color, weight=weight,
+                            dash_array="10 8", pane="route", tooltip="Птичка А–Б · не маршрут").add_to(m)
+    # Draw selected route last and with casing: it remains readable over every base.
+    ordering = [i for i in range(len(routes)) if i != selected] + ([selected] if routes else [])
+    for i in ordering:
+        r = routes[i]
         active = i == selected
-        folium.PolyLine([(c[1], c[0]) for c in r["coords"]],
-                        color="#22c55e" if active else "#3b82f6", weight=5 if active else 3,
-                        opacity=.95 if active else .65,
-                        tooltip=f"{'Основной' if active else 'Альтернатива'} · BRouter {r['alternative']} · {geodesic_length(r['coords'])/1000:.1f} км").add_to(m)
+        if not active and not config["alternatives"]:
+            continue
+        ll = [(c[1], c[0]) for c in r["coords"]]
+        title = f"{'Основной' if active else 'Запасной'} · {geodesic_length(r['coords'])/1000:.1f} км"
+        for color, weight in ((("#172554", 10), ("#fff", 8), ("#14d160", 5)) if active else (("#fff", 6), ("#2563eb", 3))):
+            folium.PolyLine(ll, color=color, weight=weight, opacity=1 if active else .8,
+                            pane="route", tooltip=title).add_to(m)
+    for i, p in enumerate(points):
+        text = config["point_labels"][i]
+        color = "#1761c7" if text == "А" else "#bc2437" if text == "Б" else "#6941b9"
+        icon = folium.DivIcon(html=f'<div style="width:32px;height:32px;border:3px solid white;border-radius:50%;background:{color};color:white;font:bold 17px/27px system-ui;text-align:center;box-shadow:0 1px 6px #0009">{text}</div>', icon_size=(38,38), icon_anchor=(19,19))
+        folium.Marker(p, icon=icon, tooltip="Старт" if text == "А" else "Финиш" if text == "Б" else f"Точка {text}").add_to(m)
     for w in (audit or {}).get("warnings", []):
-        popup = f"<b>{html.escape(w['name'])}</b><br>{html.escape(w['detail'])}<br><a href='{html.escape(w['osm'], quote=True)}' target='_blank' rel='noopener'>Объект OSM</a>"
-        folium.Marker([w["lat"], w["lon"]], tooltip=w["name"], popup=folium.Popup(popup, max_width=280),
-                      icon=folium.Icon(color="orange" if w["kind"] != "mapped_crossing" else "blue", icon="warning-sign")).add_to(m)
+        info = w["kind"] == "mapped_crossing"
+        popup = html.escape(w["name"]) + "<br>" + html.escape(w["detail"])
+        icon = folium.DivIcon(html=f'<div style="width:30px;height:30px;border:2px solid white;border-radius:6px;background:{"#1761c7" if info else "#b52d16"};color:white;font:bold 22px/26px system-ui;text-align:center;box-shadow:0 1px 5px #0008">{"i" if info else "!"}</div>', icon_size=(34,34), icon_anchor=(17,17))
+        folium.Marker([w["lat"], w["lon"]], icon=icon, tooltip=w["name"], popup=folium.Popup(popup, max_width=280)).add_to(m)
     for lon, lat in nogos:
-        folium.Circle([lat, lon], radius=150, color="#ef4444", fill=True,
-                      fill_opacity=.12, tooltip="No-go · 150 м").add_to(m)
-    folium.LayerControl(collapsed=True).add_to(m)
-    bounds = [(c[1], c[0]) for r in routes for c in r["coords"]] or list(points)
-    if len(bounds) > 1:
-        m.fit_bounds(bounds, padding=(24, 24))
+        folium.Circle([lat, lon], radius=150, color="#dc2626", weight=2, fill=True,
+                      fill_opacity=.12, pane="route", tooltip="Запрет обхода · 150 м").add_to(m)
+    if routes and config["km_marks"]:
+        coords = routes[selected]["coords"]
+        cum = chainages(coords)
+        for d in range(5000, int(cum[-1])+1, 5000):
+            lon, lat = geodesic_at(coords, cum, d)
+            folium.CircleMarker([lat,lon], radius=5, color="#fff", weight=2, fill=True,
+                                fill_color="#111827", fill_opacity=1,
+                                tooltip=f"{d//1000} км").add_to(m)
+    Fullscreen(position="topleft", title="Во весь экран", title_cancel="Вернуться").add_to(m)
+    LocateControl(position="topleft", strings={"title": "Моё местоположение"},
+                  locateOptions={"enableHighAccuracy": True}).add_to(m)
+    TileStatusControl().add_to(m)
+    if fit:
+        bounds = [(c[1],c[0]) for r in routes for c in r["coords"]] or points
+        if len(bounds) > 1:
+            m.fit_bounds(bounds, padding=(35,35))
+        elif bounds:
+            m.location = bounds[0]
     return m
 
 
@@ -730,286 +895,352 @@ def ordered_points():
 
 
 def invalidate():
-    for k in ("routes", "audits", "heat_results", "nogos", "route_points", "routing_config"):
-        st.session_state[k] = {} if k in ("audits", "heat_results") else []
+    s = st.session_state
+    for k in ("routes", "nogos", "route_points", "routing_config"):
+        s[k] = []
+    s.audits, s.heat_results = {}, {}
 
 
 def set_point(point, role):
     validate_point(*point)
     s = st.session_state
-    if role == "А — старт":
+    if role == "А":
         s.start = point
-    elif role == "Б — финиш":
+    elif role == "Б":
         s.finish = point
     else:
+        if not s.start or not s.finish:
+            raise ValueError("Сначала задайте А и Б.")
         if len(s.vias) >= 8:
-            raise ValueError("Не более 8 промежуточных точек.")
+            raise ValueError("Максимум 8 промежуточных точек.")
         s.vias.append(point)
     invalidate()
 
 
+def ensure_audit(route, primary):
+    key = route["signature"] + "|" + primary
+    if key not in st.session_state.audits:
+        with st.spinner("Проверка воды, болот и переходов…"):
+            try:
+                result = audit_route(route, primary)
+                st.session_state.audits[key] = result
+            except Exception as exc:
+                st.session_state.audits[key] = {"warnings": [], "errors": [str(exc)], "complete": False,
+                    "features": EMPTY_FEATURES, "at": datetime.now(timezone.utc).isoformat(), "count": 0, "sources": []}
+    return st.session_state.audits[key]
+
+
 def main():
-    st.set_page_config(page_title=APP, page_icon="🧭", layout="wide", initial_sidebar_state="collapsed")
-    st.markdown("""<style>
-    .block-container{max-width:1120px;padding-top:1.8rem;padding-bottom:2rem}
-    h1{font-size:clamp(1.65rem,4.5vw,2.5rem)!important;letter-spacing:-.035em}
-    .stButton button,.stDownloadButton button{min-height:46px;border-radius:8px}
-    [data-testid="stMetricValue"]{font-size:1.7rem}
-    @media(max-width:600px){.block-container{padding:1rem}.stButton button{width:100%}}
-    </style>""", unsafe_allow_html=True)
+    st.set_page_config(page_title="Pathfinder · Карта", page_icon="🧭", layout="wide", initial_sidebar_state="collapsed")
+    st.markdown('''<style>
+    .block-container{max-width:1120px;padding:1rem 1.2rem 2rem}
+    h1{font-size:24px!important;letter-spacing:-.7px;margin-bottom:0!important}
+    h2{font-size:22px!important} h3{font-size:19px!important}
+    .stButton button,.stDownloadButton button{min-height:46px;border-radius:8px;font-weight:600}
+    [data-testid="stMetricValue"]{font-size:24px}
+    .tf-legend{display:flex;gap:8px 14px;flex-wrap:wrap;font:14px/1.5 system-ui;color:#475569;padding:4px 0 10px}
+    .tf-legend span{white-space:nowrap}.tf-line{display:inline-block;width:18px;height:4px;vertical-align:middle;margin-right:4px}
+    .tf-stats{display:flex;flex-wrap:wrap;gap:8px 20px;border:1px solid #dbe2ea;border-radius:8px;padding:10px 14px;margin:8px 0;font:15px/1.6 system-ui;background:#f8fafc;color:#1e293b}
+    @media(max-width:600px){.block-container{padding:.6rem .7rem 1.5rem}.stButton button{font-size:14px;padding:.35rem .5rem}h1{font-size:22px!important}}
+    </style>''', unsafe_allow_html=True)
     s = st.session_state
     defaults = {"start": None, "finish": None, "vias": [], "routes": [], "audits": {},
-                "heat_results": {}, "nogos": [], "last_tap": None, "route_points": [], "routing_config": []}
-    for k, v in defaults.items():
+                "heat_results": {}, "nogos": [], "route_points": [], "routing_config": [],
+                "map_center": [55.19,30.20], "map_zoom": 12, "map_bounds": None,
+                "map_features": EMPTY_FEATURES, "consumed_click": None, "fit_next": False,
+                "map_epoch": 0, "ui_version": "2.0", "tap_mode": "А", "route_choice": 0}
+    for k,v in defaults.items():
         if k not in s:
             s[k] = v
-    st.caption("ПЕШИЙ МАРШРУТИЗАТОР  /  БЕЛАРУСЬ  /  OSM-АУДИТ")
-    st.title("🧭 Tactical Pathfinder SSS+++")
-    st.write("Точки → три варианта → аудит воды и грунта → GPX для AlpineQuest.")
-    st.caption("Настройки сервисов и слоёв — в боковой панели ☰ слева сверху.")
-    st.warning("Не аттестация безопасности. " + DISCLAIMER)
-
-    with st.sidebar:
-        st.header("Настройки")
-        base = st.text_input("BRouter /brouter", "https://brouter.de/brouter")
-        lookup_url = st.text_input("Lookup именно вашего сервера", LOOKUPS,
-                                   help="Для собственного сервера укажите опубликованный lookups.dat той же версии.")
-        overpass = st.selectbox("Основной Overpass", OVERPASS)
-        st.caption("Запросы передают координаты выбранным сервисам. Зеркало Overpass используется при ошибке. Публичная версия приложения не должна хранить чувствительные маршруты.")
-        st.subheader("Дополнительные тайлы")
-        topo = st.text_input("Генштаб / ГГЦ · HTTPS XYZ", "", help="Разрешённый источник с {z}/{x}/{y}. Историческая топокарта не подтверждает нынешние мосты.")
-        heat = st.text_input("Strava · разрешённый HTTPS XYZ", "", help="Нужна отдельная теплокарта без картографической подложки, 256×256. Секреты в URL не вводите.")
-        st.caption("Адрес nakarte.me{z}/{x}/{y}.png не является универсальным прокси Strava. Обход авторизации не выполняется.")
-        heat_ok = st.checkbox("Источник тайлов разрешает такой доступ")
-        heat_mode = st.selectbox("Кодировка интенсивности", ["grayscale", "colored"],
-                                 format_func=lambda x: "Светлый сигнал / чёрный фон" if x == "grayscale" else "Цветной сигнал / прозрачный фон")
-        threshold = st.slider("Порог сигнала 0–255", 1, 255, 45)
-        st.subheader("Модель марша")
-        body = st.number_input("Собственный вес, кг", 35.0, 200.0, 90.0, 1.0)
-        load = st.number_input("Груз, кг", 0.0, 65.0, 25.0, 1.0)
-        st.caption("Рост 196 см: в оригинальную формулу Pandolf не входит.")
-        grade = st.slider("Сценарный уклон, %", 0.0, 12.0, 0.0, .5,
-                          help="Это явное допущение для всего пути, не измеренный профиль высот.")
-        pauses = st.slider("Привалы, % к ходовому времени", 0, 80, 20) / 100
-        water_rate = st.slider("План воды, л/ч общего времени", .2, 1.2, .5, .1)
-        reserve = st.slider("Резерв воды, %", 0, 50, 20) / 100
-
-    with st.expander("1 · Координаты и точки маршрута", expanded=not bool(s.routes)):
-        role = st.radio("Куда добавить точку", ["А — старт", "Б — финиш", "Промежуточная"], horizontal=True)
-        tab1, tab2 = st.tabs(["WGS-84 · Lat, Lon", "СК-42 · X, Y"])
-        with tab1:
-            with st.form("wgs"):
-                c1, c2 = st.columns(2)
-                lat = c1.number_input("Широта Lat", 50.0, 58.0, 55.19, format="%.7f")
-                lon = c2.number_input("Долгота Lon", 21.0, 35.0, 30.20, format="%.7f")
-                if st.form_submit_button("Добавить WGS-84"):
+    if s.get("pending_mode"):
+        s.tap_mode = s.pop("pending_mode")
+    if s.get("reset_choice"):
+        s.route_choice = 0
+        s.reset_choice = False
+    st.title("🧭 Pathfinder")
+    st.caption("Карта → точки А / Б → маршрут → GPX")
+    map_tab, route_tab, settings_tab = st.tabs(["Карта", "Маршрут", "Настройки"])
+    with settings_tab:
+        st.subheader("Сервисы")
+        base = st.text_input("BRouter", "https://brouter.de/brouter")
+        overpass = st.selectbox("Overpass", OVERPASS)
+        lookup_url = st.text_input("Таблица lookup", LOOKUPS)
+        st.caption("В v2 разрешения foot/access обрабатываются белым списком отдельно для дорог и узлов. Неизвестное значение доступа не становится разрешением.")
+        st.subheader("Источники слоёв")
+        st.write("Генштаб и ГГЦ подключены по опубликованным адресам слоёв Nakarte. Покрытие и доступность зависят от поставщика. ГГЦ использует TMS, Генштаб — XYZ.")
+        custom_topo = st.text_input("Свой Генштаб XYZ (необязательно)", "")
+        custom_heat = st.text_input("Свой разрешённый Strava XYZ (необязательно)", "")
+        heat_permission = st.checkbox("У меня есть право доступа к выбранному источнику Strava")
+        st.caption("Без входа Strava может отвечать 401/403. Обход авторизации не выполняется; обычная OSM GPS-трассировка доступна как отдельный, честно подписанный слой.")
+        st.subheader("Нагрузка")
+        c1,c2 = st.columns(2)
+        body = c1.number_input("Вес человека, кг", 35.0,200.0,90.0,1.0)
+        load = c2.number_input("Груз, кг",0.0,65.0,25.0,1.0)
+        pauses = st.slider("Привалы, % к ходовому времени",0,80,20)/100
+        water_rate = st.slider("План воды, л/ч",.2,1.2,.5,.1)
+        reserve = st.slider("Резерв воды, %",0,50,20)/100
+        grade = st.slider("Сценарный уклон, %",0.0,12.0,0.0,.5)
+        with st.expander("Тепловой анализ — дополнительно"):
+            threshold = st.slider("Порог сигнала",1,255,45)
+            heat_mode = st.selectbox("Кодировка",["colored","grayscale"])
+        st.warning("Планирование требует интернета. Координаты передаются картографическим сервисам. OSM не подтверждает проходимость, право прохода, состояние моста или текущий разлив.")
+        st.caption("Моё местоположение на карте работает только после вашего разрешения браузеру. Никакого фонового GPS-трекинга нет.")
+    # Defaults for rendering are fixed above; widgets execute even in inactive tabs.
+    with map_tab:
+        with st.expander("Слои карты", expanded=False):
+            base_layer = st.radio("Подложка",["OSM","Спутник","CyclOSM","Генштаб"],horizontal=True)
+            c1,c2 = st.columns(2)
+            ggc = c1.checkbox("ГГЦ 1 км поверх карты")
+            heat_enabled = c2.checkbox("GPS / теплокарта")
+            if heat_enabled:
+                heat_type = st.radio("Источник активности",["GPS OSM","Strava"],horizontal=True)
+            else:
+                heat_type = "GPS OSM"
+            c1,c2 = st.columns(2)
+            wetland = c1.checkbox("Болота",True)
+            water = c2.checkbox("Каналы и ручьи",True)
+            bad_ground = c1.checkbox("Плохой грунт",True)
+            restricted = c2.checkbox("Ограничения OSM",True)
+            alternatives = c1.checkbox("Запасные маршруты",True)
+            beeline = c2.checkbox("Птичка А–Б",True)
+            km_marks = c1.checkbox("Засечки 5 км",True)
+            paper_opacity = st.slider("Непрозрачность ГГЦ",.1,1.0,.65,.05)
+            heat_opacity = st.slider("Непрозрачность GPS / Strava",.1,1.0,.85,.05)
+            if st.button("Проверить растровые слои здесь"):
+                targets = []
+                if base_layer == "Генштаб": targets.append(("Генштаб",custom_topo or TOPO_XYZ,13,False))
+                if ggc: targets.append(("ГГЦ",GGC_TMS,13,True))
+                if heat_enabled:
+                    if heat_type == "Strava" and not heat_permission:
+                        st.warning("Сначала подтвердите право доступа к Strava в настройках.")
+                    else:
+                        targets.append((heat_type,(custom_heat or STRAVA_XYZ) if heat_type == "Strava" else OSM_TRACES,14,False))
+                for name,url,z,tms in targets:
                     try:
-                        set_point((lat, lon), role)
-                        st.rerun()
+                        ok,message = probe_tile(url,*s.map_center,z,tms)
+                        (st.info if ok else st.warning)(name+": "+message)
                     except ValueError as exc:
                         st.error(str(exc))
-        with tab2:
-            with st.form("sk42"):
-                zone = st.selectbox("6-градусная зона Гаусса–Крюгера", [5, 6])
-                x = st.number_input("X · северное смещение, м", value=5921783.0, format="%.2f")
-                y = st.number_input("Y · восточное смещение с номером зоны, м", value=5583475.0, format="%.2f")
-                if st.form_submit_button("Преобразовать и добавить СК-42"):
+                if not targets:
+                    st.info("Включите Генштаб, ГГЦ или GPS-слой для проверки.")
+        if heat_enabled and heat_type == "Strava" and not heat_permission:
+            st.info("Strava не включена: подтвердите право доступа во вкладке «Настройки». GPS OSM — отдельный доступный вариант.")
+            heat_enabled = False
+        heat_url = ((custom_heat or STRAVA_XYZ) if heat_type == "Strava" else OSM_TRACES)
+        for label,url in (("Генштаб",custom_topo),("GPS / Strava",heat_url if heat_enabled else "")):
+            if url:
+                try:
+                    check_template(url)
+                except ValueError as exc:
+                    st.error(label+": "+str(exc))
+                    if label == "Генштаб": custom_topo=""
+                    else: heat_enabled=False
+        st.radio("Тап по карте",["Осмотр","А","Б","+ точка"],horizontal=True,key="tap_mode")
+        points = ordered_points()
+        ready = s.start is not None and s.finish is not None
+        c1,c2,c3 = st.columns([1.3,1,1])
+        calculate = c1.button("Построить",type="primary",disabled=not ready,use_container_width=True)
+        fit = c2.button("Весь путь",use_container_width=True)
+        scan = c3.button("Болота здесь",disabled=s.map_bounds is None,use_container_width=True)
+        if fit:
+            s.fit_next = True
+            s.map_epoch += 1
+        if calculate:
+            if geodesic_length([(p[1],p[0]) for p in points]) > 150000:
+                st.error("Слишком длинный запрос: разбейте путь на части до 150 км.")
+            else:
+                try:
+                    with st.spinner("BRouter: расчёт вариантов…"):
+                        try:
+                            meta = lookup_metadata(lookup_url)
+                        except (requests.RequestException,ValueError):
+                            meta = None
+                        profile,notes = make_profile(meta)
+                        try:
+                            new_routes,errors = build_routes(base,profile,points,[])
+                        except ValueError as exc:
+                            # Optional polygon/peat values can differ between published and deployed lookup.
+                            # Never silently switch to a standard, less restrictive routing profile.
+                            if meta and "unknown lookup" in str(exc).lower():
+                                profile,core_notes = make_profile(None)
+                                new_routes,errors = build_routes(base,profile,points,[])
+                                notes += core_notes + ["Опциональные lookup-теги не совпали с сервером; применено то же антигрязевое ядро, болота проверяются Overpass."]
+                            else:
+                                raise
+                    invalidate()
+                    s.routes,s.route_points,s.routing_config = new_routes,points,[base,profile]
+                    s.profile_text,s.profile_notes,s.route_errors = profile,notes,errors
+                    s.fit_next,s.reset_choice = True,True
+                    s.map_epoch += 1
+                    s.pending_mode="Осмотр"
+                    st.rerun()
+                except (requests.RequestException,ValueError,TypeError,KeyError) as exc:
+                    st.error("Не удалось построить: "+str(exc)[:600])
+        if scan:
+            try:
+                with st.spinner("Загрузка болот и водотоков видимой области…"):
+                    elements,source = overpass_chunk(viewport_query(s.map_bounds),overpass)
+                    # Replace this viewport result: do not accumulate unlimited objects while panning.
+                    s.map_features = osm_features(elements)
+                    s.scan_info = f"Область OSM: {len(s.map_features['features'])} объектов. {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+            except (requests.RequestException,ValueError,KeyError) as exc:
+                st.warning(str(exc))
+        route,audit = None,None
+        selected = min(int(s.route_choice),len(s.routes)-1) if s.routes else 0
+        if s.routes:
+            selected = st.selectbox("Вариант",list(range(len(s.routes))),key="route_choice",
+                format_func=lambda i:f"{'Основной' if i==0 else 'Запасной '+str(i)} · {geodesic_length(s.routes[i]['coords'])/1000:.1f} км · {sum(d/1000/v for d,v,_,_ in route_segments(s.routes[i])[0]):.1f} ч")
+            route=s.routes[selected]
+            audit=ensure_audit(route,overpass)
+        features=merge_features(s.map_features,(audit or {}).get("features"))
+        config=dict(point_labels=(["А"] if s.start else []) + [str(i+1) for i in range(len(s.vias))] + (["Б"] if s.finish else []),base=base_layer,custom_topo=custom_topo,ggc=ggc,heat=heat_enabled,
+                    heat_type=heat_type,heat_url=heat_url,paper_opacity=paper_opacity,
+                    heat_opacity=heat_opacity,wetland=wetland,water=water,bad_ground=bad_ground,
+                    restricted=restricted,alternatives=alternatives,beeline=beeline,km_marks=km_marks)
+        st.markdown('<div class="tf-legend"><span><i class="tf-line" style="background:#14a34a"></i>маршрут</span><span><i class="tf-line" style="background:#2563eb"></i>запасной</span><span>🟦 болота / вода</span><span>🟫 плохой грунт</span><span>❗ проверить</span></div>',unsafe_allow_html=True)
+        frame=map_v2(points,s.routes,selected,audit,features,s.nogos,config,s.map_center,s.map_zoom,s.fit_next)
+        s.fit_next=False
+        view=st_folium(frame,height=560,use_container_width=True,key=f"tf_map_{s.map_epoch}",
+            returned_objects=["last_clicked","bounds","zoom","center"])
+        if view:
+            if view.get("bounds"): s.map_bounds=view["bounds"]
+            if view.get("zoom") is not None: s.map_zoom=int(view["zoom"])
+            if view.get("center"):
+                center=view["center"]
+                if isinstance(center,dict) and "lat" in center:
+                    s.map_center=[float(center["lat"]),float(center.get("lng",center.get("lon")))]
+            click=view.get("last_clicked")
+            if click:
+                tap=(round(float(click["lat"]),7),round(float(click["lng"]),7))
+                if tap != s.consumed_click:
+                    s.consumed_click=tap
+                    if s.tap_mode != "Осмотр":
+                        try:
+                            mode=s.tap_mode
+                            set_point(tap,mode)
+                            s.pending_mode="Б" if mode=="А" and s.finish is None else "Осмотр" if mode=="Б" else mode
+                            st.rerun()
+                        except ValueError as exc:
+                            st.warning(str(exc))
+        if not ready:
+            st.caption("Выберите А и тапните по карте. Затем Б → тап → «Построить». Координаты можно ввести во вкладке «Маршрут».")
+        if route:
+            stats=estimate(route_segments(route)[0],body,load,grade,pauses,water_rate,reserve)
+            st.markdown(f'<div class="tf-stats"><span><b>{stats["Длина, км"]} км</b></span><span>{stats["С привалами, ч"]} ч с привалами</span><span>{len(audit["warnings"])} отметок OSM</span></div>',unsafe_allow_html=True)
+            if not audit["complete"]:
+                st.warning("Аудит частичный: не все участки удалось проверить. Подробности — «Маршрут».")
+            hazards=[w for w in audit["warnings"] if w["avoid"]]
+            if st.button("Обойти воду · радиус 150 м",disabled=not hazards,use_container_width=True):
+                try:
+                    ng=deduplicate_nogos(s.nogos,hazards)
+                    with st.spinner("Поиск обхода…"):
+                        new_routes,errors=build_routes(s.routing_config[0],s.routing_config[1],s.route_points,ng)
+                    s.routes,s.nogos,s.route_errors=new_routes,ng,errors
+                    s.reset_choice,s.fit_next=True,True
+                    s.map_epoch+=1
+                    st.rerun()
+                except (requests.RequestException,ValueError) as exc:
+                    st.error("Обход не принят: "+str(exc)[:500])
+            export_ack=st.checkbox("Понимаю: OSM не гарантирует безопасный проход")
+            partial_ok=audit["complete"] or st.checkbox("Скачать с пометкой «аудит неполный»")
+            st.download_button("📥 GPX для AlpineQuest",export_gpx(route,s.route_points,audit),
+                "pathfinder.gpx","application/gpx+xml",type="primary",use_container_width=True,
+                disabled=not(export_ack and partial_ok))
+        st.caption(s.get("scan_info","Болота вдоль выбранного маршрута загружаются при аудите. Для окрестностей приблизьте карту и нажмите «Болота здесь»."))
+        st.caption("Генштаб/ГГЦ — исторические карты. GPS OSM ≠ Strava. Болота OSM и спутник не отражают текущую воду и все препятствия.")
+
+    with route_tab:
+        st.subheader("Точки")
+        coord_type=st.radio("Формат",["WGS-84","СК-42"],horizontal=True)
+        zone=6
+        with st.form("coordinates_v2"):
+            role=st.radio("Добавить",["А","Б","+ точка"],horizontal=True)
+            if coord_type=="WGS-84":
+                c1,c2=st.columns(2)
+                lat=c1.number_input("Lat",50.0,58.0,55.19,format="%.7f")
+                lon=c2.number_input("Lon",21.0,35.0,30.20,format="%.7f")
+            else:
+                zone=st.selectbox("Зона СК-42",[5,6],index=1)
+                c1,c2=st.columns(2)
+                x=c1.number_input("X · север, м",value=5921783.0,format="%.2f")
+                y=c2.number_input("Y · восток с зоной, м",value=6583475.0,format="%.2f")
+            if st.form_submit_button("Применить координаты"):
+                try:
+                    if coord_type=="СК-42":
+                        lat,lon,accuracy,desc=sk_to_wgs(x,y,zone)
+                        s.coord_info=f"Операция СК-42: точность {accuracy} м. {desc}"
+                    set_point((lat,lon),role)
+                    s.map_center=[lat,lon]
+                    s.map_epoch+=1
+                    st.rerun()
+                except (ValueError,RuntimeError) as exc:
+                    st.error(str(exc))
+        if s.get("coord_info"): st.caption(s.coord_info)
+        points=ordered_points()
+        if points:
+            st.dataframe([{"Точка":((["А"] if s.start else [])+[str(j+1) for j in range(len(s.vias))]+(["Б"] if s.finish else []))[i],"Lat":p[0],"Lon":p[1]} for i,p in enumerate(points)],hide_index=True,use_container_width=True)
+        c1,c2=st.columns(2)
+        if c1.button("Удалить последнюю +точку",disabled=not s.vias,use_container_width=True):
+            s.vias.pop();invalidate();st.rerun()
+        if c2.button("Сбросить всё",use_container_width=True):
+            s.start,s.finish,s.vias=None,None,[]
+            s.pending_mode="А"
+            invalidate();st.rerun()
+        if s.start and s.finish:
+            az,_,direct=GEOD.inv(s.start[1],s.start[0],s.finish[1],s.finish[0])
+            st.write(f"Птичка А–Б: **{direct/1000:.2f} км** · истинный азимут **{az%360:.1f}°**")
+            with st.expander("СК-42 и дирекционный угол"):
+                zone=st.selectbox("Зона сетки",[5,6],index=1)
+                try:
+                    a_x,a_y=wgs_to_sk(*s.start,zone)
+                    b_x,b_y=wgs_to_sk(*s.finish,zone)
+                    angle=math.degrees(math.atan2(b_y-a_y,b_x-a_x))%360
+                    st.write(f"От севера сетки зоны {zone}: {angle:.1f}°. Магнитное склонение не учтено.")
+                    st.dataframe([{"Точка":i+1,"X":round(wgs_to_sk(*p,zone)[0],2),"Y":round(wgs_to_sk(*p,zone)[1],2)} for i,p in enumerate(points)],hide_index=True)
+                except (ValueError,RuntimeError) as exc: st.error(str(exc))
+        if s.routes:
+            route=s.routes[min(int(s.route_choice),len(s.routes)-1)]
+            audit=ensure_audit(route,overpass)
+            st.subheader("Аудит маршрута")
+            st.write("Завершён по OSM, не аттестация проходимости." if audit["complete"] else "НЕПОЛНЫЙ — есть ошибки загрузки.")
+            if audit["warnings"]:
+                st.dataframe([{"Км ≈":round(w["metres"]/1000,2),"Отметка":w["name"],"Основание":w["detail"]} for w in audit["warnings"]],hide_index=True,use_container_width=True)
+            else:
+                st.caption("Отметок в полученных данных нет. Это не доказательство отсутствия препятствий.")
+            st.subheader("Время и нагрузка")
+            segments,coverage=route_segments(route)
+            rows=[{"Путь":"Обход",**estimate(segments,body,load,grade,pauses,water_rate,reserve)}]
+            if s.start and s.finish:
+                direct=GEOD.inv(s.start[1],s.start[0],s.finish[1],s.finish[0])[2]
+                rows.insert(0,{"Путь":"Птичка · только сценарий",**estimate([(direct,2.0,1.8,"offroad")],body,load,grade,pauses,water_rate,reserve)})
+            st.dataframe(rows,hide_index=True,use_container_width=True)
+            st.caption(f"Теги покрытия: {coverage*100:.0f}% длины. 6.2 км/ч по grade1–2 — сценарий, не обещание темпа на 70 км. Pandolf не учитывает рост; вода — отдельный план л/ч, не медицинская норма.")
+            if heat_enabled and heat_type=="Strava" and heat_permission:
+                if st.button("Оценить сигнал Strava вдоль пути"):
                     try:
-                        la, lo, accuracy, desc = sk_to_wgs(x, y, zone)
-                        set_point((la, lo), role)
-                        s.crs_info = f"{la:.7f}, {lo:.7f}; заявленная точность операции: {accuracy if accuracy >= 0 else 'неизвестна'} м. {desc}"
-                        st.rerun()
-                    except (ValueError, RuntimeError) as exc:
-                        st.error(str(exc))
-            if s.get("crs_info"):
-                st.info(s.crs_info)
-            st.caption("X=northing, Y=easting. Семизначный Y обязателен. Точность datum shift зависит от операции и исходной карты; это не сантиметровая привязка.")
-        if s.start:
-            st.write(f"А: {s.start[0]:.6f}, {s.start[1]:.6f}")
-        for i, p in enumerate(s.vias):
-            st.write(f"Промежуточная {i+1}: {p[0]:.6f}, {p[1]:.6f}")
-        if s.finish:
-            st.write(f"Б: {s.finish[0]:.6f}, {s.finish[1]:.6f}")
-        c1, c2 = st.columns(2)
-        if c1.button("Убрать последнюю промежуточную", disabled=not s.vias):
-            s.vias.pop()
-            invalidate()
-            st.rerun()
-        if c2.button("Очистить точки и расчёты"):
-            s.start, s.finish, s.vias, s.last_tap = None, None, [], None
-            invalidate()
-            st.rerun()
-
-    points = ordered_points()
-    ready = s.start is not None and s.finish is not None
-    for label, value in (("Топокарта", topo), ("Теплокарта", heat)):
-        if value.strip():
-            try:
-                check_template(value)
-            except ValueError as exc:
-                st.error(f"{label}: {exc}")
-                if label == "Топокарта":
-                    topo = ""
-                else:
-                    heat = ""
-    if st.button("2 · Рассчитать 3 варианта и запустить аудит", type="primary", disabled=not ready, use_container_width=True):
-        if geodesic_length([(p[1], p[0]) for p in points]) > 150_000:
-            st.error("Суммарная птичка через точки длиннее 150 км. Разбейте план.")
-        else:
-            try:
-                with st.spinner("Загрузка профиля и расчёт вариантов BRouter…"):
-                    meta = None
-                    try:
-                        meta = lookup_metadata(lookup_url)
-                    except (requests.RequestException, ValueError) as exc:
-                        st.warning(f"Lookup недоступен: {exc}")
-                    profile, notes = make_profile(meta)
-                    new_routes, errors = build_routes(base, profile, points, [])
-                invalidate()
-                s.routes, s.route_points, s.routing_config = new_routes, points, [base, profile]
-                s.profile_notes, s.route_errors, s.profile_text = notes, errors, profile
-            except (requests.RequestException, ValueError) as exc:
-                st.error(f"Расчёт не выполнен: {exc}. Ранее построенный маршрут, если есть, сохранён.")
-
-    selected = 0
-    route, audit = None, None
-    if s.routes:
-        selected = st.selectbox("Основной маршрут для аудита и GPX", list(range(len(s.routes))),
-            format_func=lambda i: f"BRouter {s.routes[i]['alternative']} · {geodesic_length(s.routes[i]['coords'])/1000:.1f} км · {sum(d/1000/v for d,v,_,_ in route_segments(s.routes[i])[0]):.1f} ч хода")
-        route = s.routes[selected]
-        key = route["signature"] + "|" + overpass
-        if key not in s.audits:
-            bar = st.progress(0.0, text="Запуск OSM-аудита…")
-            try:
-                s.audits[key] = audit_route(route, overpass, bar.progress)
-            except Exception as exc:
-                # An audit failure never becomes a green/no-hazard result.
-                s.audits[key] = {"warnings": [], "errors": [str(exc)], "complete": False,
-                                 "at": datetime.now(timezone.utc).isoformat(), "sources": [], "count": 0}
-            finally:
-                bar.empty()
-        audit = s.audits[key]
-        if audit["complete"]:
-            st.info(f"OSM-аудит завершён · объектов: {audit['count']} · отметок: {len(audit['warnings'])}. Это не подтверждение безопасности.")
-        else:
-            st.error("Аудит НЕПОЛНЫЙ — маршрут не проверен на всём протяжении.")
-        with st.expander("Диагностика профиля и сервисов"):
-            st.write("Профиль пешеходный с приоритетами trekking/gravel. BRouter минимизирует взвешенную стоимость, не гарантирует минимальное время; варианты могут совпадать и перекрываться.")
-            for msg in s.get("profile_notes", []) + s.get("route_errors", []) + audit["errors"]:
-                st.write(msg)
-            st.caption("Полигональные болота проверяются отдельно: по границам коридора и содержащим областям с шагом 250 м; небольшие полностью неотмеченные объекты могут быть пропущены. Мост — тег и геометрия дороги, не водотока.")
-            st.caption("Аудит UTC: " + audit["at"])
-            st.download_button("Скачать использованный профиль .brf", s.get("profile_text", s.routing_config[1]), "anti_bog.brf", "text/plain")
-        hazards = [w for w in audit["warnings"] if w["avoid"]]
-        c1, c2 = st.columns(2)
-        if c1.button("Обойти опасные узлы", disabled=not hazards, use_container_width=True):
-            try:
-                nogos = deduplicate_nogos(s.nogos, hazards)
-                with st.spinner("Пересчёт с no-go 150 м…"):
-                    new_routes, errors = build_routes(s.routing_config[0], s.routing_config[1], s.route_points, nogos)
-                s.routes, s.nogos, s.route_errors = new_routes, nogos, errors
-                st.rerun()  # New geometry is always audited again before export.
-            except (requests.RequestException, ValueError) as exc:
-                st.error(f"Обход не принят: {exc}. Предыдущий маршрут сохранён.")
-        if c2.button("Повторить OSM-аудит", use_container_width=True):
-            # Clear only this route's query cache entries, not other users' cached data.
-            fwd, inv = local_projection(route["coords"])
-            line = transform(fwd, LineString([c[:2] for c in route["coords"]]))
-            for i in range(max(1, math.ceil(line.length/8000))):
-                seg = substring(line, max(0, i*8000-60), min(line.length, (i+1)*8000+60))
-                overpass_chunk.clear(corridor_query(list(transform(inv, seg).coords)), overpass)
-            del s.audits[key]
-            st.rerun()
-        st.caption("Обход не гарантирует капитальный мост. Если граф не содержит подходящего перехода, сервис может отказать; новые опасности снова отмечаются.")
-
-    st.subheader("3 · Карта и визуальная проверка")
-    st.caption("Зелёная — выбранный маршрут · синяя — альтернативы · красный пунктир — ориентир А–Б. Тапните по карте, затем подтвердите добавление точки.")
-    view = st_folium(make_map(points, s.routes, selected, audit, s.nogos, topo, heat if heat_ok else ""),
-                     height=510, use_container_width=True,
-                     returned_objects=["last_clicked"], key="route_map")
-    if view and view.get("last_clicked"):
-        tap = view["last_clicked"]
-        s.last_tap = (float(tap["lat"]), float(tap["lng"]))
-    if s.last_tap:
-        st.caption(f"Последний тап: {s.last_tap[0]:.7f}, {s.last_tap[1]:.7f}")
-        if st.button(f"Добавить выбранную точку → {role}"):
-            try:
-                set_point(s.last_tap, role)
-                s.last_tap = None
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-    if ready:
-        az, _, direct = GEOD.inv(s.start[1], s.start[0], s.finish[1], s.finish[0])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Птичка А–Б", f"{direct/1000:.2f} км")
-        c2.metric("Истинный азимут", f"{az%360:.1f}°")
-        grid_zone = st.selectbox("Зона для дирекционного угла", [5, 6], index=1)
-        try:
-            ax, ay = wgs_to_sk(*s.start, grid_zone)
-            bx, by = wgs_to_sk(*s.finish, grid_zone)
-            angle = math.degrees(math.atan2(by-ay, bx-ax)) % 360
-            c3.metric("Дирекционный угол СК-42", f"{angle:.1f}°")
-            with st.expander("Обратный пересчёт WGS-84 → СК-42"):
-                converted = []
-                for i, p in enumerate(points):
-                    xx, yy = wgs_to_sk(*p, grid_zone)
-                    converted.append({"Точка": "А" if i == 0 else "Б" if i == len(points)-1 else str(i),
-                                      "Зона": grid_zone, "X, м": round(xx, 2), "Y, м": round(yy, 2)})
-                st.dataframe(converted, hide_index=True, use_container_width=True)
-        except (ValueError, RuntimeError) as exc:
-            c3.write("СК-42: " + str(exc))
-        st.caption("Азимут истинный, угол — от севера сетки выбранной зоны. Магнитное склонение не учтено. Вынос в соседнюю зону увеличивает искажения.")
-
-    if not route:
-        st.info("Добавьте А и Б, затем рассчитайте маршрут. Меню настроек доступно слева; на телефоне откройте боковую панель.")
-        return
-    if audit["warnings"]:
-        with st.expander("4 · Найденные точки внимания", expanded=True):
-            st.dataframe([{"км ≈": round(w["metres"]/1000, 2), "Отметка": w["name"],
-                           "Основание": w["detail"], "OSM": w["osm"]} for w in audit["warnings"]],
-                         hide_index=True, use_container_width=True)
-
-    st.subheader("5 · Сигнал активности Strava")
-    st.caption("Это доля длины с сигналом на разрешённой теплокарте, не вероятность проходимости и не число посетителей. Пустые/недоступные тайлы не равны «мёртвой» дороге.")
-    hkey = route["signature"] + "|" + heat + f"|{threshold}|{heat_mode}"
-    heat_requested = st.button("Повторить анализ теплокарты", disabled=not (heat and heat_ok))
-    if heat and heat_ok and (hkey not in s.heat_results or heat_requested):
-        bar = st.progress(0.0)
-        try:
-            s.heat_results[hkey] = heat_analysis(route["coords"], heat, threshold, mode=heat_mode, progress=bar.progress)
-        except (requests.RequestException, ValueError, OSError) as exc:
-            st.error(str(exc))
-        finally:
-            bar.empty()
-    hr = s.heat_results.get(hkey)
-    if hr:
-        if hr["index"] is None:
-            st.warning("Индекс: НЕТ ДАННЫХ. Получено 0% длины маршрута.")
-        else:
-            st.write(f"Сигнал на {hr['index']:.1f}% исследованной длины · данные получены для {hr['coverage']:.1f}% всего маршрута · активный сигнал: {hr['hot_km']:.2f} км.")
-        if hr["errors"]:
-            with st.expander("Недоступные тайлы"):
-                st.write("\n".join(hr["errors"]))
-    else:
-        st.info("Индекс не вычислен. Задайте разрешённый XYZ-источник в настройках и запустите анализ.")
-
-    st.subheader("6 · Нагрузка и экспорт")
-    segments, coverage = route_segments(route)
-    rows = [{"Вариант": "По птичке напрямик · только сценарий", **estimate([(direct, 2.0, 1.8, "Бездорожье")], body, load, grade, pauses, water_rate, reserve)},
-            {"Вариант": "Выбранный обход BRouter", **estimate(segments, body, load, grade, pauses, water_rate, reserve)}]
-    st.dataframe(rows, hide_index=True, use_container_width=True)
-    st.caption(f"Теги покрытия получены для {coverage*100:.0f}% длины по сообщениям BRouter; неизвестное покрытие — 3 км/ч. grade1–2: 6.2; grade3: 5.2; тропы: 4.5; тяжёлое/птичка: 2.0 км/ч. Темп не гарантирован на 45–70 км с 25 кг.")
-    with st.expander("Допущения Pandolf и воды"):
-        st.code("M(W) = 1.5W + 2(W+L)(L/W)^2 + η(W+L)(1.5V² + 0.35VG)\nW,L: кг; V: м/с; G: уклон в процентах; M: ватт\nkcal = Σ M × seconds / 4184\nВода: общее время × выбранные л/ч × (1 + резерв)", language="text")
-        st.write("Сценарные η: дорога 1.0; grade1–2 1.1; grade3/тропа 1.2; неизвестное 1.5; тяжёлое/птичка 1.8. Реальные грунт, снег, сырость и усталость могут резко увеличить расход. Рост в Pandolf не используется. Вода — отдельный плановый коэффициент, НЕ вывод из Pandolf и не медицинская рекомендация. Значения не учитывают температуру, индивидуальное потоотделение и электролиты.")
-    acknowledge = st.checkbox("Я проверю переходы на местности; понимаю ограничения OSM и расчётов.")
-    allow_partial = audit["complete"] or st.checkbox("Экспортировать НЕПОЛНО проверенный маршрут с явной пометкой в GPX")
-    st.download_button("📥 СКАЧАТЬ БОЕВОЙ GPX ДЛЯ ALPINEQUEST",
-                       export_gpx(route, s.route_points, audit, hr),
-                       file_name="tactical_pathfinder.gpx", mime="application/gpx+xml",
-                       disabled=not (acknowledge and allow_partial), type="primary", use_container_width=True)
-    st.caption("В GPX: выбранный трек, отдельная птичка А–Б, исходные точки, предупреждения, засечки 5 км. Сначала сохраните офлайн-карту в AlpineQuest. Планировщик требует интернет; бесплатное облако может засыпать. Для личного доступа включите ограничение аудитории в настройках публикации.")
+                        with st.spinner("Анализ разрешённой теплокарты…"):
+                            hr=heat_analysis(route["coords"],heat_url,threshold,mode=heat_mode)
+                        s.heat_results[route["signature"]]=hr
+                    except (requests.RequestException,ValueError,OSError) as exc: st.warning(str(exc))
+                hr=s.heat_results.get(route["signature"])
+                if hr:
+                    if hr["index"] is None: st.warning("Strava: нет данных, а не 0% активности.")
+                    else: st.write(f"Сигнал: {hr['index']:.1f}% исследованной длины; получено {hr['coverage']:.1f}% данных маршрута.")
+                    if hr["errors"]: st.caption("; ".join(hr["errors"][:3]))
+            with st.expander("Диагностика и профиль"):
+                st.write("Варианты могут перекрываться; самый быстрый — по модели среди полученных, не глобальная гарантия.")
+                for msg in s.get("profile_notes",[])+s.get("route_errors",[])+audit["errors"]: st.write(msg)
+                st.caption("Аудит UTC: "+audit["at"])
+                st.download_button("Профиль BRF",s.get("profile_text",s.routing_config[1]),"anti_bog_v2.brf","text/plain")
+                if st.button("Повторить аудит"):
+                    # A nonce would defeat caching; explicitly clear the selected route's chunk queries.
+                    fwd,inv=local_projection(route["coords"])
+                    line=transform(fwd,LineString([c[:2] for c in route["coords"]]))
+                    for i in range(max(1,math.ceil(line.length/8000))):
+                        seg=substring(line,max(0,i*8000-60),min(line.length,(i+1)*8000+60))
+                        overpass_chunk.clear(corridor_query(list(transform(inv,seg).coords)),overpass)
+                    s.audits.pop(route["signature"]+"|"+overpass,None)
+                    st.rerun()
 
 
 if __name__ == "__main__":
