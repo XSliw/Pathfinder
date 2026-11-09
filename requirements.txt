@@ -1,0 +1,8 @@
+streamlit>=1.39,<2
+folium>=0.17,<0.21
+streamlit-folium>=0.23,<1
+gpxpy>=1.6.2,<2
+requests>=2.32.3,<3
+pyproj>=3.7,<4
+Pillow>=11,<13
+shapely>=2.0.6,<3
