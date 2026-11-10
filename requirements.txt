@@ -1,4 +1,4 @@
-streamlit>=1.39,<2
+streamlit>=1.41,<2
 folium>=0.17,<0.21
 streamlit-folium>=0.23,<1
 gpxpy>=1.6.2,<2
