@@ -1,5 +1,5 @@
 """Tactical Pathfinder SSS+++ — Python 3.11+, streamlit run app.py.
-All application logic is in this file. Online planning; GPX is usable offline.
+Routing logic lives here; map events use map_bridge.py and map_frontend/. Online planning; GPX is usable offline.
 No service credentials, fabricated routes, or simulated audit results.
 """
 from __future__ import annotations
@@ -12,8 +12,11 @@ import math
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from pathlib import Path
+import uuid
+import streamlit.components.v1 as components
+from map_bridge import apply_map_event
 
-import folium
 import gpxpy
 import gpxpy.gpx
 import requests
@@ -25,12 +28,9 @@ from pyproj.transformer import TransformerGroup
 from shapely import make_valid
 from shapely.geometry import LineString, Point, Polygon, mapping
 from shapely.ops import nearest_points, polygonize, substring, transform, unary_union
-from streamlit_folium import st_folium
-from folium.plugins import Fullscreen, LocateControl
-from branca.element import MacroElement, Element
-from jinja2 import Template
 
 APP = "Pathfinder"
+MAP_COMPONENT = components.declare_component("pathfinder_map_v4", path=str(Path(__file__).with_name("map_frontend")))
 GEOD = Geod(ellps="WGS84")
 HEADERS = {"User-Agent": "TacticalPathfinder/1.0 (personal walking route planner)"}
 OVERPASS = ("https://overpass-api.de/api/interpreter",
@@ -769,202 +769,61 @@ def probe_tile(template, lat, lon, zoom, tms=False):
         return False, str(exc)[:220]
 
 
-class TileStatusControl(MacroElement):
-    """Recover Leaflet after hidden tabs, viewport changes and flaky tile services."""
-    def __init__(self):
-        super().__init__()
-        self._name = "TileStatusControl"
-        self._template = Template(r"""{% macro script(this, kwargs) %}
-        (function(){
-          const map = {{this._parent.get_name()}};
-          const root = map.getContainer();
-          map.attributionControl.setPrefix(false);
-          let timer = 0, lastWidth = 0, lastHeight = 0, destroyed = false;
-          function refresh(){
-            clearTimeout(timer);
-            timer = setTimeout(function(){
-              if (destroyed || !root.isConnected) return;
-              const size = root.getBoundingClientRect();
-              if (size.width < 1 || size.height < 1) return;
-              if(size.width !== lastWidth || size.height !== lastHeight){
-                lastWidth=size.width;lastHeight=size.height;
-                map.invalidateSize({pan:false, debounceMoveend:true});
-              }
-            },120);
-          }
-          const observer = new ResizeObserver(refresh);
-          observer.observe(root);
-          const visibility = function(){if(!document.hidden) {
-            lastWidth=0; refresh();
-          }};
-          window.addEventListener('resize',refresh);
-          window.addEventListener('orientationchange',refresh);
-          document.addEventListener('visibilitychange',visibility);
-          const status = L.control({position:'bottomleft'});
-          status.onAdd = function(){
-            const box=L.DomUtil.create('div','pf-tile-status');
-            box.setAttribute('role','status'); box.style.display='none';
-            L.DomEvent.disableClickPropagation(box); this.box=box; return box;
-          };status.addTo(map);
-          let dismiss;
-          function notice(message){
-            status.box.replaceChildren();
-            const text=document.createElement('span'); text.textContent=message;
-            const close=document.createElement('button');close.textContent='×';
-            close.setAttribute('aria-label','Закрыть уведомление');
-            close.onclick=function(){status.box.style.display='none';};
-            status.box.append(text,close);status.box.style.display='flex';
-            clearTimeout(dismiss);
-            dismiss=setTimeout(function(){status.box.style.display='none';},9000);
-          }
-          function bind(layer){
-            if(!layer.on || !layer._url || layer.__pfBound) return;
-            layer.__pfBound=true;
-            let loaded=0, failed=0;
-            layer.on('loading',function(){loaded=0;failed=0;});
-            layer.on('tileload',function(){loaded++;});
-            layer.on('tileerror',function(){failed++;});
-            layer.on('load',function(){
-              // Missing edge tiles are normal on historical map sheets.
-              if(!map.hasLayer(layer) || loaded || failed<3) return;
-              const label=layer.options.tfLabel||'Карта';
-              if(layer.options.tfFallback){
-                notice('Нет связи с картой. Проверьте интернет и нажмите ↻.');
-              } else {
-                map.removeLayer(layer);
-                notice(label+' недоступен. '+(layer.options.tfBase ? 'Показана OSM.' : 'Слой отключён.')+' Для повтора нажмите ↻.');
-              }
-            });
-          }
-          map.eachLayer(bind);map.on('layeradd',function(e){bind(e.layer);});
-          map.on('unload',function(){
-            destroyed=true;observer.disconnect();clearTimeout(timer);clearTimeout(dismiss);
-            window.removeEventListener('resize',refresh);
-            window.removeEventListener('orientationchange',refresh);
-            document.removeEventListener('visibilitychange',visibility);
-          });
-          refresh();
-        })();
-        {% endmacro %}""")
-
-
-MAP_CSS = """
-html,body {margin:0;background:#edf0ec;font-family:system-ui,-apple-system,sans-serif}
-.leaflet-container {background:#edf0ec; -webkit-tap-highlight-color:transparent}
-.leaflet-control-attribution {font:11px/1.5 system-ui!important;max-width:90%;
-  background:rgba(255,255,255,.9)!important;padding:2px 6px!important;border-radius:4px 0 0 0}
-.leaflet-control-attribution a {color:#475569!important}
-.leaflet-bar {border:1px solid #dce1e6!important;box-shadow:0 2px 8px #14203214!important;
-  border-radius:10px!important;overflow:hidden}
-.leaflet-bar a {width:42px!important;height:42px!important;line-height:42px!important;
-  color:#233c50!important;background-color:#fff!important}
-.leaflet-control-scale-line {font:11px system-ui;border-color:#64748b;background:#ffffffe0}
-.pf-tile-status {max-width:min(290px,70vw);align-items:center;gap:6px;padding:8px 12px;
-  border:1px solid #e4d5b5;border-radius:8px;background:#fffaf0;color:#71511d;font:13px/1.4 system-ui;
-  box-shadow:0 2px 12px #0001}
-.pf-tile-status button {background:none;border:0;font-size:22px;min-width:44px;min-height:44px;cursor:pointer;color:inherit}
-.leaflet-popup-content-wrapper {border-radius:10px;font:14px/1.5 system-ui}
-:focus-visible {outline:3px solid #2783de;outline-offset:2px}
-"""
-
-
-def map_v2(points, routes, selected, audit, features, nogos, config, center, zoom, fit=False):
-    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True,
-                   prefer_canvas=True, zoom_control=True, max_zoom=20,
-                   fade_animation=False, zoom_animation=False, marker_zoom_animation=False)
-    m.get_root().header.add_child(Element("<style>" + MAP_CSS + "</style>"))
-    folium.map.CustomPane("paper", z_index=240).add_to(m)
-    folium.map.CustomPane("heat", z_index=360).add_to(m)
-    folium.map.CustomPane("terrain", z_index=430).add_to(m)
-    folium.map.CustomPane("route", z_index=610).add_to(m)
+def map_payload(points, routes, selected, audit, features, nogos, config, center, zoom, state):
+    """Plain data only. Browser owns Leaflet lifetime; no regenerated HTML or iframe ids."""
+    osm_attr = '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a>'
     bases = {
-        "OSM": ("https://tile.openstreetmap.org/{z}/{x}/{y}.png", '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a>', 19),
-        "Спутник": ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", '<a href="https://www.esri.com/en-us/legal/terms/data-attributions" target="_blank" rel="noopener">Esri · Maxar · Earthstar Geographics</a>', 19),
-        "CyclOSM": ("https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png", '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a> · <a href="https://www.cyclosm.org/" target="_blank" rel="noopener">CyclOSM</a>', 20),
-        "Генштаб": (TOPO_XYZ, '<a href="https://nakarte.me/" target="_blank" rel="noopener">Топокарты · Nakarte / AtloMaps</a>', 13),
+        "OSM": ("https://tile.openstreetmap.org/" + "{z}/{x}/{y}.png", osm_attr, 19),
+        "Спутник": ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + "{z}/{y}/{x}", '<a href="https://www.esri.com/en-us/legal/terms/data-attributions" target="_blank" rel="noopener">Esri · Maxar · Earthstar Geographics</a>', 19),
+        "CyclOSM": ("https://a.tile-cyclosm.openstreetmap.fr/cyclosm/" + "{z}/{x}/{y}.png", osm_attr + ' · CyclOSM', 20),
+        "Генштаб": (config["custom_topo"] or TOPO_XYZ, '<a href="https://nakarte.me/" target="_blank" rel="noopener">Топокарты · Nakarte / AtloMaps</a>', 13),
     }
+    tiles = [dict(url=bases["OSM"][0], attribution=osm_attr, native=19, label="OSM", fallback=True)]
     name = config["base"]
-    url, attr, native = bases[name]
-    if name == "Генштаб" and config["custom_topo"]:
-        url = config["custom_topo"]
-    # A real basemap stays under historical sheets: uncovered areas are not grey.
-    osm_url, osm_attr, _ = bases["OSM"]
-    folium.TileLayer(osm_url, attr=osm_attr, name="OSM", max_native_zoom=19,
-                     max_zoom=20, tf_label="OSM", tf_fallback=True,
-                     keep_buffer=4, update_when_idle=True, update_when_zooming=False).add_to(m)
     if name != "OSM":
-        folium.TileLayer(url, attr=attr, name=name, max_native_zoom=native, max_zoom=20,
-                         tf_label=name, tf_base=True, keep_buffer=4,
-                         update_when_idle=True, update_when_zooming=False).add_to(m)
+        url, attr, native = bases[name]
+        tiles.append(dict(url=url, attribution=attr, native=native, label=name, base=True))
     if config["ggc"]:
-        folium.TileLayer(GGC_TMS, attr='<a href="https://nakarte.me/" target="_blank" rel="noopener">ГГЦ · Nakarte</a>', name="ГГЦ 1 км", tms=True,
-                         overlay=True, pane="paper", max_native_zoom=13, max_zoom=20, keep_buffer=4,
-                         update_when_idle=True, update_when_zooming=False, opacity=config["paper_opacity"], tf_label="ГГЦ 1 км").add_to(m)
+        tiles.append(dict(url=GGC_TMS, attribution='<a href="https://nakarte.me/" target="_blank" rel="noopener">ГГЦ · Nakarte</a>',
+                          native=13, label="ГГЦ 1 км", tms=True, pane="paper", opacity=config["paper_opacity"]))
     if config["heat"]:
-        folium.TileLayer(config["heat_url"], attr='<a href="https://www.strava.com/maps/global-heatmap" target="_blank" rel="noopener">© Strava</a>' if config["heat_type"] == "Strava" else '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">GPS © OpenStreetMap</a>',
-                         name=config["heat_type"], overlay=True, pane="heat", opacity=config["heat_opacity"],
-                         max_native_zoom=14, max_zoom=20, keep_buffer=4,
-                         update_when_idle=True, update_when_zooming=False, tf_label=config["heat_type"]).add_to(m)
+        attr = '<a href="https://www.strava.com/maps/global-heatmap" target="_blank" rel="noopener">© Strava</a>' if config["heat_type"] == "Strava" else 'GPS ' + osm_attr
+        tiles.append(dict(url=config["heat_url"], attribution=attr, native=14, label=config["heat_type"], pane="heat", opacity=config["heat_opacity"]))
     styles = {
-        "wetland": {"color": "#075985", "fillColor": "#06b6d4", "fillOpacity": .30, "weight": 2.5, "dashArray": "5 4"},
-        "water": {"color": "#0067da", "weight": 3.5, "opacity": .95},
-        "bad_ground": {"color": "#9a3412", "weight": 5, "dashArray": "6 5"},
-        "restricted": {"color": "#be123c", "weight": 4, "dashArray": "2 6"},
+        "wetland": {"color":"#075985","fillColor":"#06b6d4","fillOpacity":.30,"weight":2.5,"dashArray":"5 4"},
+        "water": {"color":"#0067da","weight":3.5,"opacity":.95},
+        "bad_ground": {"color":"#9a3412","weight":5,"dashArray":"6 5"},
+        "restricted": {"color":"#be123c","weight":4,"dashArray":"2 6"},
     }
-    allowed = {k for k in styles if config[k]}
-    visible = {"type": "FeatureCollection", "features": [f for f in features.get("features", []) if f["properties"]["kind"] in allowed]}
-    if visible["features"]:
-        folium.GeoJson(visible, name="Болота / вода / грунт", pane="terrain",
-                       style_function=lambda f: styles[f["properties"]["kind"]],
-                       tooltip=folium.GeoJsonTooltip(fields=["description"], labels=False, sticky=False)).add_to(m)
-    if len(points) >= 2 and config["beeline"]:
-        for color, weight in (("#fff", 5), ("#dc2626", 3)):
-            folium.PolyLine([points[0], points[-1]], color=color, weight=weight,
-                            dash_array="10 8", pane="route", tooltip="Птичка А–Б · не маршрут").add_to(m)
-    # Draw selected route last and with casing: it remains readable over every base.
-    ordering = [i for i in range(len(routes)) if i != selected] + ([selected] if routes else [])
+    visible = {"type":"FeatureCollection", "features":[f for f in features.get("features",[]) if config.get(f["properties"]["kind"],False)]}
+    lines=[]
+    if len(points)>=2 and config["beeline"]:
+        lines.append(dict(coords=[points[0],points[-1]],strokes=[("#fff",5),("#dc2626",3)],dash="10 8",title="Птичка А–Б · не маршрут"))
+    ordering=[i for i in range(len(routes)) if i != selected]+([selected] if routes else [])
     for i in ordering:
-        r = routes[i]
-        active = i == selected
-        if not active and not config["alternatives"]:
-            continue
-        ll = [(c[1], c[0]) for c in r["coords"]]
-        title = f"{'Основной' if active else 'Запасной'} · {geodesic_length(r['coords'])/1000:.1f} км"
-        for color, weight in ((("#172554", 10), ("#fff", 8), ("#14d160", 5)) if active else (("#fff", 6), ("#2563eb", 3))):
-            folium.PolyLine(ll, color=color, weight=weight, opacity=1 if active else .8,
-                            pane="route", tooltip=title).add_to(m)
-    for i, p in enumerate(points):
-        text = config["point_labels"][i]
-        color = "#1761c7" if text == "А" else "#bc2437" if text == "Б" else "#6941b9"
-        icon = folium.DivIcon(html=f'<div style="width:32px;height:32px;border:3px solid white;border-radius:50%;background:{color};color:white;font:bold 17px/27px system-ui;text-align:center;box-shadow:0 1px 6px #0009">{text}</div>', icon_size=(38,38), icon_anchor=(19,19))
-        folium.Marker(p, icon=icon, tooltip="Старт" if text == "А" else "Финиш" if text == "Б" else f"Точка {text}").add_to(m)
-    for w in (audit or {}).get("warnings", []):
-        info = w["kind"] == "mapped_crossing"
-        popup = html.escape(w["name"]) + "<br>" + html.escape(w["detail"])
-        icon = folium.DivIcon(html=f'<div style="width:30px;height:30px;border:2px solid white;border-radius:6px;background:{"#1761c7" if info else "#b52d16"};color:white;font:bold 22px/26px system-ui;text-align:center;box-shadow:0 1px 5px #0008">{"i" if info else "!"}</div>', icon_size=(34,34), icon_anchor=(17,17))
-        folium.Marker([w["lat"], w["lon"]], icon=icon, tooltip=w["name"], popup=folium.Popup(popup, max_width=280)).add_to(m)
-    for lon, lat in nogos:
-        folium.Circle([lat, lon], radius=150, color="#dc2626", weight=2, fill=True,
-                      fill_opacity=.12, pane="route", tooltip="Запрет обхода · 150 м").add_to(m)
+        active=i==selected
+        if not active and not config["alternatives"]: continue
+        r=routes[i];coords=[(c[1],c[0]) for c in r["coords"]]
+        title=f"{'Основной' if active else 'Запасной'} · {geodesic_length(r['coords'])/1000:.1f} км"
+        strokes = [("#172554",10),("#fff",8),("#14d160",5)] if active else [("#fff",6),("#2563eb",3)]
+        lines.append(dict(coords=coords,strokes=strokes,opacity=1 if active else .8,title=title))
+    markers=[dict(coords=p,label=config["point_labels"][i],title="Старт" if config["point_labels"][i]=="А" else "Финиш" if config["point_labels"][i]=="Б" else "Точка "+config["point_labels"][i]) for i,p in enumerate(points)]
+    warnings=[dict(lat=w["lat"],lon=w["lon"],name=w["name"],detail=w["detail"],info=w["kind"]=="mapped_crossing") for w in (audit or {}).get("warnings",[])]
+    km=[]
     if routes and config["km_marks"]:
-        coords = routes[selected]["coords"]
-        cum = chainages(coords)
-        for d in range(5000, int(cum[-1])+1, 5000):
-            lon, lat = geodesic_at(coords, cum, d)
-            folium.CircleMarker([lat,lon], radius=5, color="#fff", weight=2, fill=True,
-                                fill_color="#111827", fill_opacity=1,
-                                tooltip=f"{d//1000} км").add_to(m)
-    Fullscreen(position="topleft", title="Во весь экран", title_cancel="Вернуться").add_to(m)
-    LocateControl(position="topleft", strings={"title": "Моё местоположение"},
-                  locateOptions={"enableHighAccuracy": True}).add_to(m)
-    TileStatusControl().add_to(m)
-    if fit:
-        bounds = [(c[1],c[0]) for r in routes for c in r["coords"]] or points
-        if len(bounds) > 1:
-            m.fit_bounds(bounds, padding=(35,35))
-        elif bounds:
-            m.location = bounds[0]
-    return m
+        coords=routes[selected]["coords"];cum=chainages(coords)
+        for d in range(5000,int(cum[-1])+1,5000):
+            lon,lat=geodesic_at(coords,cum,d);km.append(dict(coords=[lat,lon],title=f"{d//1000} км"))
+    # Fit to selected path, not every alternate; full-resolution geometry stays in GPX.
+    fit_bounds=[(c[1],c[0]) for c in routes[selected]["coords"]] if routes else points
+    if len(fit_bounds)>1:
+        fit_bounds=[(min(p[0] for p in fit_bounds),min(p[1] for p in fit_bounds)),
+                    (max(p[0] for p in fit_bounds),max(p[1] for p in fit_bounds))]
+    return dict(session=state.map_session, mode=state.tap_mode, acks=state.map_seen,
+                tiles=tiles, styles=styles, features=visible, lines=lines, points=markers,
+                warnings=warnings, nogos=nogos, km=km, center=center, zoom=zoom, fit_bounds=fit_bounds,
+                command=dict(id=state.map_epoch,kind=state.map_command,fit=state.fit_next),
+                view_request=state.viewport_request, view_completed=state.viewport_done)
 
 
 def ordered_points():
@@ -1008,7 +867,7 @@ def ensure_audit(route, primary):
     return st.session_state.audits[key]
 
 
-UI_CSS = '\n:root {--pf-blue:#1768b8;--pf-ink:#203346;--pf-muted:#617284;--pf-border:#e2e8ed}\n.stApp {background:#f6f8fa;color:var(--pf-ink)}\n.block-container {max-width:1120px;padding:1.25rem 2rem 2.5rem}\n[data-testid="stHeader"] {height:0;background:transparent}\n[data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {display:none!important}\n.pf-header {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0 24px}\n.pf-brand {display:flex;align-items:center;gap:12px}\n.pf-mark {display:grid;place-items:center;width:44px;height:44px;background:#1768b8;color:#fff;border-radius:12px;font-size:30px;font-weight:500}\n.pf-brand h1 {font:700 25px/1.2 system-ui;letter-spacing:-.9px;padding:0!important;margin:0!important;color:#203346}\n.pf-brand p {font:14px/1.5 system-ui;color:#617284;margin:3px 0 0}\n.pf-badge {font:600 11px/1.3 system-ui;letter-spacing:1.4px;color:#617284}\nh2 {font-size:23px!important} h3 {font-size:19px!important}\n.stTabs [data-baseweb="tab-list"] {gap:8px;border-bottom:1px solid var(--pf-border);padding:0 0 8px}\n.stTabs [data-baseweb="tab"] {height:44px;border-radius:8px;padding:0 18px;color:#617284;font-weight:600}\n.stTabs [aria-selected="true"] {background:#e6f0fa;color:#135fa8}\n.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {display:none}\n.stTabs [data-baseweb="tab-panel"] {padding-top:16px}\n.stButton button,.stDownloadButton button,[data-testid="stPopover"] button {min-height:44px;border-radius:8px;font-weight:600;border-color:#dce3ea}\n.stButton button:focus-visible,button:focus-visible {outline:3px solid #2783de;outline-offset:2px}\n[data-testid="stCaptionContainer"] {color:#617284;font-size:14px}\n.st-key-map_tools [data-testid="stHorizontalBlock"],.st-key-map_actions [data-testid="stHorizontalBlock"] {flex-wrap:nowrap!important;gap:8px!important}\n.st-key-map_tools [data-testid="stColumn"],.st-key-map_actions [data-testid="stColumn"] {min-width:0!important;flex:1 1 0!important}\n.st-key-map_tools [data-testid="stColumn"]:last-child {flex:0 0 48px!important}\n.st-key-map_modes [role="radiogroup"] {display:flex;flex-flow:row nowrap!important;gap:6px;padding:4px;background:#edf1f5;border-radius:10px}\n.st-key-map_modes [data-testid="stRadio"] label {flex:1;justify-content:center;margin:0!important;min-height:44px;padding:8px 4px!important;border-radius:7px}\n.st-key-map_modes [data-testid="stRadio"] label:has(input:checked) {background:#fff;color:#135fa8;box-shadow:0 1px 3px #18334712}\n.st-key-map_modes [data-testid="stRadio"] label > div:first-child {position:absolute;opacity:0;pointer-events:none}\n.st-key-map_modes [data-testid="stRadio"] label:focus-within {outline:3px solid #2783de;outline-offset:1px}\n.st-key-map_modes [data-testid="stRadio"] p {font-weight:600;font-size:14px;white-space:nowrap}\n.st-key-map_canvas {overflow:hidden;border:1px solid #dce3e9;border-radius:12px;background:#edf0ec}\n.st-key-map_canvas iframe {display:block;border:0;border-radius:12px}\n[data-testid="stExpander"] {border-color:#e2e8ed;border-radius:10px;background:#fff}\n[data-testid="stMetricValue"] {font-size:24px}\n.tf-legend {display:flex;gap:8px 16px;flex-wrap:wrap;font:14px/1.6 system-ui;color:#526579;padding:4px 0}\n.tf-legend span {white-space:nowrap}\n.tf-line {display:inline-block;width:18px;height:4px;vertical-align:middle;margin-right:5px;border-radius:2px}\n.tf-stats {display:flex;flex-wrap:wrap;gap:8px 24px;border:1px solid #dbe4ec;border-radius:10px;padding:14px 16px;margin:8px 0;font:15px/1.6 system-ui;background:#fff;color:#203346}\n[data-testid="stPopoverBody"] {max-height:75dvh;overflow-y:auto;max-width:calc(100vw - 24px)}\n@media(max-width:600px){\n .block-container {padding:.5rem 1rem 1.5rem}\n .pf-header {padding:8px 0 18px}.pf-brand h1 {font-size:23px}.pf-badge {display:none}\n .stTabs [data-baseweb="tab-list"] {gap:4px}\n .stTabs [data-baseweb="tab"] {flex:1;padding:0 12px}\n .stTabs [data-baseweb="tab-panel"] {padding-top:12px}\n .stButton button {font-size:14px;padding:8px}\n .st-key-map_canvas iframe {height:clamp(360px,58svh,560px)!important;min-height:360px}\n .st-key-map_tools,.st-key-map_actions {font-size:14px}\n}\n@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}\n'
+UI_CSS = '\n:root {--pf-blue:#1768b8;--pf-ink:#203346;--pf-muted:#617284;--pf-border:#e2e8ed}\n.stApp {background:#f6f8fa;color:var(--pf-ink)}\n.block-container {max-width:1120px;padding:1.25rem 2rem 2.5rem}\n[data-testid="stHeader"] {height:0;background:transparent}\n[data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {display:none!important}\n.pf-header {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0 24px}\n.pf-brand {display:flex;align-items:center;gap:12px}\n.pf-mark {display:grid;place-items:center;width:44px;height:44px;background:#1768b8;color:#fff;border-radius:12px;font-size:30px;font-weight:500}\n.pf-brand h1 {font:700 25px/1.2 system-ui;letter-spacing:-.9px;padding:0!important;margin:0!important;color:#203346}\n.pf-brand p {font:14px/1.5 system-ui;color:#617284;margin:3px 0 0}\n.pf-badge {font:600 11px/1.3 system-ui;letter-spacing:1.4px;color:#617284}\nh2 {font-size:23px!important} h3 {font-size:19px!important}\n.stTabs [data-baseweb="tab-list"] {gap:8px;border-bottom:1px solid var(--pf-border);padding:0 0 8px}\n.stTabs [data-baseweb="tab"] {height:44px;border-radius:8px;padding:0 18px;color:#617284;font-weight:600}\n.stTabs [aria-selected="true"] {background:#e6f0fa;color:#135fa8}\n.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {display:none}\n.stTabs [data-baseweb="tab-panel"] {padding-top:16px}\n.stButton button,.stDownloadButton button,[data-testid="stPopover"] button {min-height:44px;border-radius:8px;font-weight:600;border-color:#dce3ea}\n.stButton button:focus-visible,button:focus-visible {outline:3px solid #2783de;outline-offset:2px}\n[data-testid="stCaptionContainer"] {color:#617284;font-size:14px}\n.st-key-map_tools [data-testid="stHorizontalBlock"],.st-key-map_actions [data-testid="stHorizontalBlock"] {flex-wrap:nowrap!important;gap:8px!important}\n.st-key-map_tools [data-testid="stColumn"],.st-key-map_actions [data-testid="stColumn"] {min-width:0!important;flex:1 1 0!important}\n.st-key-map_tools [data-testid="stColumn"]:last-child {flex:0 0 48px!important}\n.st-key-map_modes [role="radiogroup"] {display:flex;flex-flow:row nowrap!important;gap:6px;padding:4px;background:#edf1f5;border-radius:10px}\n.st-key-map_modes [data-testid="stRadio"] label {flex:1;justify-content:center;margin:0!important;min-height:44px;padding:8px 4px!important;border-radius:7px}\n.st-key-map_modes [data-testid="stRadio"] label:has(input:checked) {background:#fff;color:#135fa8;box-shadow:0 1px 3px #18334712}\n.st-key-map_modes [data-testid="stRadio"] label > div:first-child {position:absolute;opacity:0;pointer-events:none}\n.st-key-map_modes [data-testid="stRadio"] label:focus-within {outline:3px solid #2783de;outline-offset:1px}\n.st-key-map_modes [data-testid="stRadio"] p {font-weight:600;font-size:14px;white-space:nowrap}\n.st-key-map_canvas {overflow:hidden;border:1px solid #dce3e9;border-radius:12px;background:#edf0ec}\n.st-key-map_canvas iframe {display:block;border:0;border-radius:12px}\n[data-testid="stExpander"] {border-color:#e2e8ed;border-radius:10px;background:#fff}\n[data-testid="stMetricValue"] {font-size:24px}\n.tf-legend {display:flex;gap:8px 16px;flex-wrap:wrap;font:14px/1.6 system-ui;color:#526579;padding:4px 0}\n.tf-legend span {white-space:nowrap}\n.tf-line {display:inline-block;width:18px;height:4px;vertical-align:middle;margin-right:5px;border-radius:2px}\n.tf-stats {display:flex;flex-wrap:wrap;gap:8px 24px;border:1px solid #dbe4ec;border-radius:10px;padding:14px 16px;margin:8px 0;font:15px/1.6 system-ui;background:#fff;color:#203346}\n[data-testid="stPopoverBody"] {max-height:75dvh;overflow-y:auto;max-width:calc(100vw - 24px)}\n@media(max-width:600px){\n .block-container {padding:.5rem 1rem 1.5rem}\n .pf-header {padding:8px 0 18px}.pf-brand h1 {font-size:23px}.pf-badge {display:none}\n .stTabs [data-baseweb="tab-list"] {gap:4px}\n .stTabs [data-baseweb="tab"] {flex:1;padding:0 12px}\n .stTabs [data-baseweb="tab-panel"] {padding-top:12px}\n .stButton button {font-size:14px;padding:8px}\n .st-key-map_tools,.st-key-map_actions {font-size:14px}\n}\n@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}\n'
 
 
 def main():
@@ -1019,10 +878,15 @@ def main():
                 "heat_results": {}, "nogos": [], "route_points": [], "routing_config": [],
                 "map_center": [55.19,30.20], "map_zoom": 12, "map_bounds": None,
                 "map_features": EMPTY_FEATURES, "consumed_click": None, "fit_next": False,
-                "map_epoch": 0, "ui_version": "3.0", "tap_mode": "А", "route_choice": 0}
+                "map_epoch": 0, "ui_version": "4.0", "tap_mode": "А", "route_choice": 0,
+                "map_session": uuid.uuid4().hex, "map_seen": {}, "map_notice": None,
+                "viewport_request": 0, "viewport_done": 0, "scan_requested": False, "map_command": "center"}
     for k,v in defaults.items():
         if k not in s:
             s[k] = v
+    # Component value is persisted by its fixed widget key. Consume it BEFORE widgets.
+    # No st.rerun() on taps: the component event already caused the current run.
+    apply_map_event(s, s.get("pathfinder_map_v4"), set_point)
     if s.get("pending_mode"):
         s.tap_mode = s.pop("pending_mode")
     if s.get("reset_choice"):
@@ -1033,6 +897,7 @@ def main():
                 '<span class="pf-badge">ПЛАНИРОВЩИК</span></header>', unsafe_allow_html=True)
     map_tab, route_tab, settings_tab = st.tabs(["Карта", "Маршрут", "Настройки"])
     with settings_tab:
+        st.caption("Pathfinder 4.0 · новая карта с защитой от повторных событий")
         st.subheader("Сервисы")
         base = st.text_input("BRouter", "https://brouter.de/brouter")
         overpass = st.selectbox("Overpass", OVERPASS)
@@ -1114,7 +979,7 @@ def main():
         with tools[2]:
             if st.button("", icon=":material/refresh:", help="Перезагрузить карту и повторить загрузку слоёв", use_container_width=True):
                 s.map_epoch += 1
-                st.rerun()
+                s.map_command = "retry"
         with st.container(key="map_modes"):
             st.radio("Тап по карте",["Осмотр","А","Б","+ точка"],horizontal=True,key="tap_mode",
                      label_visibility="collapsed")
@@ -1125,7 +990,9 @@ def main():
         with st.container(key="map_actions"):
             c1,c2 = st.columns([1.35,1])
             calculate = c1.button("Построить маршрут",type="primary",disabled=not ready,use_container_width=True)
-            scan = c2.button("Болота здесь",help="Загрузить болота и водотоки в видимой области",use_container_width=True)
+            if c2.button("Болота здесь",help="Загрузить болота и водотоки в видимой области",use_container_width=True):
+                s.viewport_request += 1
+            scan = s.pop("scan_requested", False)
         if fit:
             s.fit_next = True
             s.map_epoch += 1
@@ -1183,36 +1050,14 @@ def main():
                     heat_type=heat_type,heat_url=heat_url,paper_opacity=paper_opacity,
                     heat_opacity=heat_opacity,wetland=wetland,water=water,bad_ground=bad_ground,
                     restricted=restricted,alternatives=alternatives,beeline=beeline,km_marks=km_marks)
-        frame=map_v2(points,s.routes,selected,audit,features,s.nogos,config,s.map_center,s.map_zoom,s.fit_next)
-        s.fit_next=False
-        # Only this fragment reruns on pan/zoom. No full-page rerun, route audit or new iframe.
-        @st.fragment
-        def live_map():
-            view=st_folium(frame,height=560,use_container_width=True,key=f"tf_map_{s.map_epoch}",
-                returned_objects=["last_clicked","bounds","zoom","center"])
-            if not view:
-                return
-            if view.get("bounds"): s.map_bounds=view["bounds"]
-            if view.get("zoom") is not None: s.map_zoom=int(view["zoom"])
-            if view.get("center"):
-                center=view["center"]
-                if isinstance(center,dict) and "lat" in center:
-                    s.map_center=[float(center["lat"]),float(center.get("lng",center.get("lon")))]
-            click=view.get("last_clicked")
-            if click:
-                tap=(round(float(click["lat"]),7),round(float(click["lng"]),7))
-                if tap != s.consumed_click:
-                    s.consumed_click=tap
-                    if s.tap_mode != "Осмотр":
-                        try:
-                            mode=s.tap_mode
-                            set_point(tap,mode)
-                            s.pending_mode="Б" if mode=="А" and s.finish is None else "Осмотр" if mode=="Б" else mode
-                            st.rerun(scope="app")
-                        except ValueError as exc:
-                            st.warning(str(exc))
+        payload = map_payload(points,s.routes,selected,audit,features,s.nogos,config,s.map_center,s.map_zoom,s)
         with st.container(key="map_canvas"):
-            live_map()
+            # Fixed key + one browser instance. Rendering never emits a value by itself.
+            MAP_COMPONENT(**payload, key="pathfinder_map_v4", default=None)
+        s.fit_next = False
+        s.map_command = "center"
+        if s.map_notice:
+            st.warning(s.map_notice)
         with st.expander("Обозначения и источники"):
             st.markdown('<div class="tf-legend"><span><i class="tf-line" style="background:#14a34a"></i>маршрут</span><span><i class="tf-line" style="background:#2563eb"></i>запасной</span><span>▧ болота / вода</span><span>▨ плохой грунт</span><span>! проверить</span></div>',unsafe_allow_html=True)
             st.caption("Генштаб/ГГЦ — исторические карты. GPS OSM ≠ Strava. Данные не подтверждают текущую проходимость.")
